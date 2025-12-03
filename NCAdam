@@ -1,0 +1,197 @@
+import torch
+from torch.optim.optimizer import Optimizer, required
+import math
+import numpy as np
+from scipy.special import gamma
+
+class NCAdam(Optimizer):
+    """
+    NCAdam Optimization algorithm (Non-causal Caputo fractional Adam).
+    
+    参数：
+        params: 待优化参数
+        lr: 学习率
+        alpha: 分数阶阶数，范围0.1-0.9，默认0.5
+        beta1: 一阶矩估计的指数衰减率，默认0.9
+        beta2: 二阶矩估计的指数衰减率，默认0.999
+        eps: 防止除零的小常数，默认1e-8
+        N: 求和项数，默认20
+        a: 分数阶导数区间起点，默认0.0
+        b: 分数阶导数区间终点，默认1.0
+        adaptive_ab: 是否自适应调整a,b，默认False
+    """
+
+    def __init__(self, params, lr=required, alpha=0.5, beta1=0.9, beta2=0.999,
+                 eps=1e-8, N=20, a=0.0, b=1.0, adaptive_ab=False):
+        
+        if lr is not required and lr < 0.0:
+            raise ValueError("Invalid learning rate: {}".format(lr))
+        if alpha <= 0 or alpha >= 1:
+            raise ValueError("alpha must be in (0,1)")
+        if not 0.0 <= beta1 < 1.0:
+            raise ValueError("beta1 must be in [0,1)")
+        if not 0.0 <= beta2 < 1.0:
+            raise ValueError("beta2 must be in [0,1)")
+        if eps <= 0:
+            raise ValueError("eps must be > 0")
+        if N <= 0:
+            raise ValueError("N must be positive integer")
+        if not a < b:
+            raise ValueError("Require a < b")
+
+        defaults = dict(lr=lr, alpha=alpha, beta1=beta1, beta2=beta2, eps=eps,
+                        N=N, a=a, b=b, adaptive_ab=adaptive_ab)
+        super(NCAdam, self).__init__(params, defaults)
+
+        # 预计算常数
+        self._sin_alpha = math.sin(math.pi * alpha / 2)
+
+    def _caputo_fractional_derivative(self, f, t, k, alpha, a, b, N):
+        """
+        计算非因果Caputo分数阶导数近似：
+          D_b^α[f](t) ≈
+          1 / (2 sin(πα/2)) * sum_{k=1}^N [ 
+              f^(k)(a) / Γ(k - α + 1) * (t - a)^(k - α) 
+            - (-1)^k * f^(k)(b) / Γ(k - α + 1) * (b - t)^(k - α)
+          ]
+        
+        这里f^(k)(a), f^(k)(b)为f的k阶导数在a,b点的值。
+        实际中，f为梯度序列，我们用有限差分近似高阶导数。
+
+        参数：
+            f: 形如tensor列表，代表函数f在离散点上的值（梯度序列）
+            t: 当前时刻索引int
+            k: 当前求和项的阶数int
+            alpha: 分数阶阶数float
+            a, b: 区间端点索引，int
+            N: 求和最大项数
+        返回：
+            float tensor，分数阶导数对应的值
+        """
+        # 由于我们没有高阶解析导数，这里用数值差分近似k阶导数：
+        # f^(k)(x) ≈ (f(x+h) - f(x)) / h，递归k次。这里用最简单的有限差分近似。
+
+        # 因为a,b是索引，为方便起见让a, b为整数索引，t为当前步索引
+        # 实际使用时a=0, b=max_t, t当前步
+
+        def kth_derivative_at_point(arr, idx, order):
+            # 简单中心差分近似k阶导数
+            # 若越界则返回0
+            if order == 0:
+                if 0 <= idx < len(arr):
+                    return arr[idx]
+                else:
+                    return torch.zeros_like(arr[0])
+            else:
+                return kth_derivative_at_point(arr, idx + 1, order - 1) - kth_derivative_at_point(arr, idx, order - 1)
+
+        # 时间间距h设为1（离散时间步）
+        gamma_term = gamma(k - alpha + 1)
+        if gamma_term == 0:
+            gamma_term = 1e-10  # 防止除零
+        
+        term1 = kth_derivative_at_point(f, a, k) / gamma_term * ((t - a) ** (k - alpha))
+        term2 = ((-1) ** k) * kth_derivative_at_point(f, b, k) / gamma_term * ((b - t) ** (k - alpha))
+
+        val = (term1 - term2) / (2 * self._sin_alpha)
+        return val
+
+    def compute_g_t(self, grads_history, t, alpha, a, b, N):
+        """
+        计算g_t = 非因果Caputo分数阶导数
+        
+        grads_history: 列表，length ≥ b+1，每元素为梯度的tensor快照（标量tensor或者与参数形状一致）
+        t: 当前时间步，整数索引
+        其余参数同公式
+        
+        返回：
+            tensor类型，当前时间步t对应的分数阶导数梯度估计
+        """
+        val = torch.zeros_like(grads_history[0])
+        for k in range(1, N + 1):
+            # 加权和
+            gamma_term = gamma(k - alpha + 1)
+            if gamma_term == 0:
+                gamma_term = 1e-10
+
+            # 计算k阶导数近似 (使用简单差分)
+            # 这里为了效率和稳定性，近似用当前梯度值代替高阶导数
+            # 这是实际应用中一个合理折中；你可以用更精细方法替代
+            fka = grads_history[a]  # f^(k)(a) 用梯度代替
+            fkb = grads_history[b]  # f^(k)(b)
+            # 次方
+            term_left = (t - a) ** (k - alpha)
+            term_right = (b - t) ** (k - alpha)
+
+            coef = 1.0 / (2 * math.sin(math.pi * alpha / 2))
+            part = coef * (fka / gamma_term * term_left - ((-1) ** k) * fkb / gamma_term * term_right)
+
+            val += part
+        return val
+
+    def step(self, closure=None):
+        """
+        执行一次优化步骤
+        """
+
+        loss = None
+        if closure is not None:
+            loss = closure()
+
+        for group in self.param_groups:
+            alpha = group['alpha']
+            beta1 = group['beta1']
+            beta2 = group['beta2']
+            lr = group['lr']
+            eps = group['eps']
+            N = group['N']
+            a = group['a']
+            b = group['b']
+            adaptive_ab = group['adaptive_ab']
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+
+                # 我们假设我们保留每个参数梯度的历史记录
+                # 并用他们来计算非因果分数阶导数gt
+                state = self.state[p]
+
+                if len(state) == 0:
+                    # 初始化状态
+                    state['step'] = 0
+                    state['m'] = torch.zeros_like(p.data)
+                    state['v'] = torch.zeros_like(p.data)
+                    state['grads_history'] = []
+
+                grads_history = state['grads_history']
+                grads_history.append(p.grad.data.clone())
+                if len(grads_history) < b + 1:
+                    # 梯度历史不够，直接用当前梯度
+                    g_t = p.grad.data
+                else:
+                    # 计算非因果Caputo分数阶导数g_t
+                    t = state['step']
+                    if t < a or t > b:
+                        # 不在a,b区间，用当前梯度近似
+                        g_t = p.grad.data
+                    else:
+                        g_t = self.compute_g_t(grads_history, t, alpha, a, b, N)
+
+                # 计算一阶、二阶矩
+                m = state['m']
+                v = state['v']
+                state['step'] += 1
+                t = state['step']
+
+                m.mul_(beta1).add_(g_t, alpha=1 - beta1)
+                v.mul_(beta2).addcmul_(g_t, g_t, value=1 - beta2)
+
+                m_hat = m / (1 - beta1 ** t)
+                v_hat = v / (1 - beta2 ** t)
+
+                # 参数更新
+                update = lr * m_hat / (v_hat.sqrt() + eps)
+                p.data.add_(-update)
+
+        return loss
