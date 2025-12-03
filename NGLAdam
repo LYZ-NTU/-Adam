@@ -1,0 +1,178 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.autograd as autograd
+import math
+from collections import deque
+import matplotlib.pyplot as plt
+import numpy as np
+import random
+
+# --- 设置随机种子保障复现 ---
+seed = 42
+torch.manual_seed(seed)
+np.random.seed(seed)
+random.seed(seed)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# --- NGLAdam 优化器 ---
+class NGLAdam(optim.Optimizer):
+    def __init__(self, params,
+                 lr=1e-3, alpha=0.8,
+                 beta1=0.9, beta2=0.999,
+                 eps=1e-8, h=0.02, N=12,
+                 adapt_lr=True, adapt_h=True,
+                 adapt_step=100, lr_decay=0.95,
+                 h_decay=0.9, h_growth=1.02,
+                 min_lr=1e-6, max_lr=1e-2,
+                 min_h=1e-5, max_h=0.05,
+                 max_grad_norm=5.0):
+
+        super().__init__(params, dict(lr=lr, alpha=alpha, beta1=beta1, beta2=beta2,
+                                     eps=eps, h=h, N=N))
+        self.max_grad_norm = max_grad_norm
+        self.coeffs_cache = {}
+        self._precompute_all_coeffs()
+
+        self.adapt_lr = adapt_lr
+        self.adapt_h = adapt_h
+
+        self.adapt_step = adapt_step
+        self.lr_decay = lr_decay
+        self.h_decay = h_decay
+        self.h_growth = h_growth
+
+        self.min_lr = min_lr
+        self.max_lr = max_lr
+        self.min_h = min_h
+        self.max_h = max_h
+
+        self._step_counter = 0
+        self._last_loss = float('inf')  # 初始为无穷大保证第一次执行更新
+
+    def _precompute_all_coeffs(self):
+        for i, group in enumerate(self.param_groups):
+            alpha = group['alpha']
+            N = group['N']
+            coeffs = []
+            gamma_alpha_plus_1 = math.gamma(alpha + 1)
+            for k in range(N + 1):
+                sign = (-1)**k
+                denom = math.gamma(k + 1) * math.gamma(alpha - k + 1)
+                coeff = sign * gamma_alpha_plus_1 / denom
+                coeffs.append(coeff)
+            self.coeffs_cache[i] = torch.tensor(coeffs, dtype=torch.float64)
+
+    def _update_coeffs(self, group_index):
+        group = self.param_groups[group_index]
+        alpha = group['alpha']
+        N = group['N']
+        coeffs = []
+        gamma_alpha_plus_1 = math.gamma(alpha + 1)
+        for k in range(N + 1):
+            sign = (-1)**k
+            denom = math.gamma(k + 1) * math.gamma(alpha - k + 1)
+            coeff = sign * gamma_alpha_plus_1 / denom
+            coeffs.append(coeff)
+        self.coeffs_cache[group_index] = torch.tensor(coeffs, dtype=torch.float64)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        self._step_counter += 1
+
+        for i, group in enumerate(self.param_groups):
+            alpha = group['alpha']
+            beta1 = group['beta1']
+            beta2 = group['beta2']
+            lr = group['lr']
+            eps = group['eps']
+            h = group['h']
+            N = group['N']
+
+            coeffs = self.coeffs_cache[i].to(group['params'][0].device).to(group['params'][0].dtype)
+            factor = 1 / (2 * math.sin(math.pi * alpha / 2) * (h ** alpha))
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+
+                grad = p.grad.data
+                grad_norm = grad.norm()
+                if grad_norm > self.max_grad_norm:
+                    grad = grad * (self.max_grad_norm / grad_norm)
+
+                state = self.state[p]
+
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['m'] = torch.zeros_like(p.data)
+                    state['v'] = torch.zeros_like(p.data)
+                    state['param_hist'] = deque(maxlen=2 * N + 1)
+
+                state['step'] += 1
+                step = state['step']
+
+                param_hist = state['param_hist']
+                param_hist.append(p.data.detach().clone())
+
+                if len(param_hist) < 2 * N + 1:
+                    g_t = grad
+                else:
+                    center_idx = N
+                    hist_list = list(param_hist)
+                    gl_grad = torch.zeros_like(p.data, dtype=torch.float64)
+                    for k in range(N + 1):
+                        f_t_k = hist_list[center_idx - k].to(torch.float64)
+                        f_t_pk = hist_list[center_idx + k].to(torch.float64)
+                        gl_grad += coeffs[k] * (f_t_k - f_t_pk)
+                    gl_grad = factor * gl_grad
+                    g_t = gl_grad.to(p.data.device).to(p.data.dtype)
+
+                m = state['m']
+                v = state['v']
+
+                m.mul_(beta1).add_(g_t, alpha=1 - beta1)
+                v.mul_(beta2).addcmul_(g_t, g_t, value=1 - beta2)
+
+                m_hat = m / (1 - beta1 ** step)
+                v_hat = v / (1 - beta2 ** step)
+
+                denom = v_hat.sqrt().add(eps)
+                p.data.addcdiv_(m_hat, denom, value=-lr)
+
+            # 自适应更新 lr 和 h
+            if (self._step_counter % self.adapt_step) == 0 and loss is not None:
+                current_loss = loss.item()
+                loss_diff = current_loss - self._last_loss
+                for group in self.param_groups:
+                    # 学习率自适应
+                    if self.adapt_lr:
+                        old_lr = group['lr']
+                        if loss_diff > 0 or current_loss > 1e2:
+                            group['lr'] = max(group['lr'] * self.lr_decay, self.min_lr)
+                        else:
+                            group['lr'] = min(group['lr'] / self.lr_decay, self.max_lr)
+                        if group['lr'] != old_lr:
+                            print(f"Step {self._step_counter}: lr adjusted {old_lr:.3e} -> {group['lr']:.3e}")
+
+                    # h自适应
+                    if self.adapt_h:
+                        old_h = group['h']
+                        if loss_diff < 0:
+                            group['h'] = min(group['h'] * self.h_growth, self.max_h)
+                        else:
+                            group['h'] = max(group['h'] * self.h_decay, self.min_h)
+                        if group['h'] != old_h:
+                            print(f"Step {self._step_counter}: h adjusted {old_h:.3e} -> {group['h']:.3e}")
+
+                for gi in range(len(self.param_groups)):
+                    self._update_coeffs(gi)
+
+                self._last_loss = current_loss
+
+        return loss
