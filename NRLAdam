@@ -1,0 +1,164 @@
+import torch
+from torch.optim.optimizer import Optimizer, required
+import math
+import numpy as np
+from scipy.special import gamma
+
+class NRLAdam(Optimizer):
+    """
+    NRLAdam优化器 (Non-causal Riemann–Liouville fractional Adam)
+
+    分数阶导数定义：
+        NRL_a^α D_b^α[f](t) = 
+            1 / (2 sin(πα/2)) * sum_{k=0}^N [ 
+                f^(k)(a) / Γ(k - α + 1) (t - a)^(k - α) 
+               - (-1)^k f^(k)(b) / Γ(k - α + 1) (b - t)^(k - α)
+            ]
+
+    参数解释：
+        params: 待优化参数
+        lr: 学习率
+        alpha: 分数阶，0.1~0.9
+        beta1, beta2: 一阶和二阶矩衰减
+        eps: 防止除零
+        N: 级数求和项数，默认20
+        a,b: 分数阶导数区间端点，默认0和N
+        adaptive_ab: 是否自适应调整a,b，默认False
+    """
+
+    def __init__(self, params, lr=required, alpha=0.5, beta1=0.9, beta2=0.999,
+                 eps=1e-8, N=20, a=0, b=20, adaptive_ab=False):
+
+        if lr is not required and lr < 0.0:
+            raise ValueError("Invalid learning rate: {}".format(lr))
+        if alpha <= 0 or alpha >= 1:
+            raise ValueError("alpha must be in (0,1)")
+        if not 0.0 <= beta1 < 1.0:
+            raise ValueError("beta1 must be in [0, 1)")
+        if not 0.0 <= beta2 < 1.0:
+            raise ValueError("beta2 must be in [0, 1)")
+        if eps <= 0:
+            raise ValueError("eps must be > 0")
+        if N <= 0:
+            raise ValueError("N must be positive integer")
+        if not a < b:
+            raise ValueError("Require a < b")
+
+        defaults = dict(lr=lr, alpha=alpha, beta1=beta1, beta2=beta2, eps=eps,
+                        N=N, a=a, b=b, adaptive_ab=adaptive_ab)
+        super(NRLAdam, self).__init__(params, defaults)
+
+        self.pi_alpha_over_2 = math.pi * alpha / 2
+        self.sin_alpha_term = math.sin(self.pi_alpha_over_2)
+
+    def _kth_derivative_approx(self, arr, idx, k):
+        """
+        用简单的有限差分近似计算第k阶导数
+        arr: 梯度序列tensor列表
+        idx: 位置
+        k: 阶数，>=0
+        """
+        if k == 0:
+            if 0 <= idx < len(arr):
+                return arr[idx]
+            else:
+                return torch.zeros_like(arr[0])
+        else:
+            # 递归差分 f^(k)(x) ≈ f^(k-1)(x+1) - f^(k-1)(x)
+            return self._kth_derivative_approx(arr, idx + 1, k - 1) - self._kth_derivative_approx(arr, idx, k - 1)
+
+    def compute_g_t(self, grads_history, t, alpha, a, b, N):
+        """
+        计算非因果Riemann-Liouville分数阶导数g_t
+        grads_history: 梯度时间序列（tensor列表）
+        t: 当前时间索引
+        其他参数见类文档
+        返回tensor，梯度分数阶导数g_t
+        """
+        val = torch.zeros_like(grads_history[0])
+        coef = 1.0 / (2 * self.sin_alpha_term)
+        for k in range(0, N + 1):
+            gamma_term = gamma(k - alpha + 1)
+            if gamma_term == 0:
+                gamma_term = 1e-10
+
+            # 计算f^(k)(a)和f^(k)(b)
+            fka = self._kth_derivative_approx(grads_history, a, k)
+            fkb = self._kth_derivative_approx(grads_history, b, k)
+
+            term_left = (t - a) ** (k - alpha) if t >= a else 0.0
+            term_right = (b - t) ** (k - alpha) if t <= b else 0.0
+
+            part = coef * (fka / gamma_term * term_left - ((-1) ** k) * fkb / gamma_term * term_right)
+
+            val += part
+        return val
+
+    def step(self, closure=None):
+        """
+        执行一步参数更新
+        """
+        loss = None
+        if closure is not None:
+            loss = closure()
+
+        for group in self.param_groups:
+            alpha = group['alpha']
+            beta1 = group['beta1']
+            beta2 = group['beta2']
+            lr = group['lr']
+            eps = group['eps']
+            N = group['N']
+            a = group['a']
+            b = group['b']
+            adaptive_ab = group['adaptive_ab']
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+
+                state = self.state[p]
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['m'] = torch.zeros_like(p.data)
+                    state['v'] = torch.zeros_like(p.data)
+                    state['grads_history'] = []
+
+                grads_history = state['grads_history']
+
+                # 保存当前梯度
+                grads_history.append(p.grad.data.clone())
+
+                # 为控制内存，限制history size不超过b+1
+                max_history_len = b + 1
+                if len(grads_history) > max_history_len:
+                    grads_history.pop(0)
+
+                t = state['step']
+
+                # 如果历史数据不足，直接用当前梯度
+                if len(grads_history) < max_history_len or not (a <= t <= b):
+                    g_t = p.grad.data
+                else:
+                    # 计算非因果Riemann-Liouville分数阶导数梯度
+                    g_t = self.compute_g_t(grads_history, t, alpha, a, b, N)
+
+                # 更新一阶二阶矩
+                m = state['m']
+                v = state['v']
+
+                state['step'] += 1
+                t += 1
+
+                m.mul_(beta1).add_(g_t, alpha=1 - beta1)
+                v.mul_(beta2).addcmul_(g_t, g_t, value=1 - beta2)
+
+                # 偏差修正
+                m_hat = m / (1 - beta1 ** t)
+                v_hat = v / (1 - beta2 ** t)
+
+                # 更新参数
+                update = lr * m_hat / (v_hat.sqrt() + eps)
+                p.data.add_(-update)
+
+        return loss
